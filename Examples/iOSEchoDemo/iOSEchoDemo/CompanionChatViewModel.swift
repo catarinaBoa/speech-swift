@@ -400,6 +400,10 @@ final class CompanionChatViewModel {
             lastResponseAudioDuration += Double(samples.count) / 24000.0
             pipelineState = "speaking..."
             dbg("audioDelta: \(samples.count) samples (\(String(format: "%.2f", Double(samples.count)/24000))s)")
+            // Capture for tts_debug.wav so we can inspect what's being
+            // sent to the speaker (helps diagnose audio artifacts like
+            // the end-of-synthesis click).
+            ttsRecordBuffer.append(contentsOf: samples)
             do { try player.play(samples: samples, sampleRate: 24000) }
             catch { dbg("playback error: \(error)") }
 
@@ -471,6 +475,11 @@ final class CompanionChatViewModel {
             try session.setCategory(.playAndRecord, mode: .default,
                                     options: [.defaultToSpeaker, .allowBluetoothHFP])
             try session.setActive(true)
+            // `.defaultToSpeaker` is honoured at category-set time but iOS
+            // can quietly route .playAndRecord audio to the earpiece at
+            // runtime (especially after the mic is hot). Force the route
+            // to the bottom speaker so TTS playback is audible.
+            try session.overrideOutputAudioPort(.speaker)
         } catch {
             errorMessage = "Mic access failed: \(error.localizedDescription)"
             return

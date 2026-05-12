@@ -204,22 +204,24 @@ public class FSMNMultiHeadAttention: Module {
 /// Pre-norm transformer block from s3tokenizer-v3:
 ///   x = x + attn(LN(x))
 ///   x = x + Linear(GELU(Linear(LN(x))))
+///
+/// Upstream stores the MLP as `nn.Sequential(Linear, GELU(), Linear)`, so the
+/// safetensors keys are `mlp.0.weight/bias` (in→hidden) and `mlp.2.weight/bias`
+/// (hidden→out). We expose them as `mlpFc1` / `mlpFc2` and let the weight
+/// loader translate the names — Sequential isn't used anywhere else in this
+/// package and would just add ceremony for two Linears.
 public class ResidualAttentionBlockV3: Module {
     @ModuleInfo var attn: FSMNMultiHeadAttention
     @ModuleInfo(key: "attn_ln") var attnLN: LayerNorm
-    @ModuleInfo var mlp: Sequential
+    @ModuleInfo var mlpFc1: Linear
+    @ModuleInfo var mlpFc2: Linear
     @ModuleInfo(key: "mlp_ln") var mlpLN: LayerNorm
 
     public init(config: SpeechTokenizerConfig) {
         self._attn.wrappedValue = FSMNMultiHeadAttention(config: config)
         self._attnLN.wrappedValue = LayerNorm(dimensions: config.nAudioState, eps: 1e-5)
-
-        // Upstream stores the MLP as `nn.Sequential(Linear, GELU(), Linear)` — keys
-        // `mlp.0.weight`, `mlp.2.weight`. Match this layout so safetensor names align.
-        let fc1 = Linear(config.nAudioState, config.mlpDim)
-        let fc2 = Linear(config.mlpDim, config.nAudioState)
-        self._mlp.wrappedValue = Sequential(layers: fc1, GELU(), fc2)
-
+        self._mlpFc1.wrappedValue = Linear(config.nAudioState, config.mlpDim)
+        self._mlpFc2.wrappedValue = Linear(config.mlpDim, config.nAudioState)
         self._mlpLN.wrappedValue = LayerNorm(dimensions: config.nAudioState, eps: 1e-5)
 
         super.init()
@@ -227,7 +229,7 @@ public class ResidualAttentionBlockV3: Module {
 
     public func callAsFunction(_ x: MLXArray, rope: MLXNN.RoPE) -> MLXArray {
         var h = x + attn(attnLN(x), rope: rope)
-        h = h + mlp(mlpLN(h))
+        h = h + mlpFc2(gelu(mlpFc1(mlpLN(h))))
         return h
     }
 }

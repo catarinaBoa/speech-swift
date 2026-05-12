@@ -296,4 +296,72 @@ public enum CosyVoiceWeightLoader {
             act.update(parameters: ModuleParameters(values: ["alpha": .value(alpha)]))
         }
     }
+
+    // MARK: - Speech Tokenizer (zero-shot voice cloning)
+
+    /// Load weights into a `SpeechTokenizerModel` from `speech_tokenizer.safetensors`.
+    ///
+    /// Expected keys (produced by `convert_speech_tokenizer` in
+    /// `speech-models/models/cosyvoice-tts/export/convert.py`):
+    /// - encoder.conv1.weight/bias                                 (MLX-layout [out, k, in])
+    /// - encoder.conv2.weight/bias                                 (MLX-layout)
+    /// - encoder.blocks.{i}.attn.{query,key,value,out}.weight/bias (key has no bias)
+    /// - encoder.blocks.{i}.attn.fsmn_block.weight                 (MLX-layout, depthwise k=31)
+    /// - encoder.blocks.{i}.attn_ln.weight/bias                    (LayerNorm)
+    /// - encoder.blocks.{i}.mlp.0.weight/bias                      (Linear, in→hidden)
+    /// - encoder.blocks.{i}.mlp.2.weight/bias                      (Linear, hidden→in)
+    /// - encoder.blocks.{i}.mlp_ln.weight/bias                     (LayerNorm)
+    /// - quantizer._codebook.project_down.weight/bias              (Linear 1280→8)
+    ///
+    /// Conv1d weights are already transposed to MLX `[out, kernel, in]` by the
+    /// conversion script, so all Conv1d loads use `transpose: false`.
+    public static func loadSpeechTokenizer(
+        _ tokenizer: SpeechTokenizerModel, from url: URL
+    ) throws {
+        let weights = try CommonWeightLoader.loadSafetensors(url: url)
+
+        // Subsampling convs (channels-first stride-2 each).
+        CommonWeightLoader.applyConv1dWeights(
+            to: tokenizer.encoder.conv1, prefix: "encoder.conv1", from: weights, transpose: false)
+        CommonWeightLoader.applyConv1dWeights(
+            to: tokenizer.encoder.conv2, prefix: "encoder.conv2", from: weights, transpose: false)
+
+        // Transformer blocks.
+        for (i, block) in tokenizer.encoder.blocks.enumerated() {
+            let p = "encoder.blocks.\(i)"
+
+            // Attention projections — key has no bias, the rest do.
+            CommonWeightLoader.applyLinearWeights(
+                to: block.attn.query, prefix: "\(p).attn.query", from: weights)
+            CommonWeightLoader.applyLinearWeights(
+                to: block.attn.key, prefix: "\(p).attn.key", from: weights)
+            CommonWeightLoader.applyLinearWeights(
+                to: block.attn.value, prefix: "\(p).attn.value", from: weights)
+            CommonWeightLoader.applyLinearWeights(
+                to: block.attn.out, prefix: "\(p).attn.out", from: weights)
+
+            // FSMN depthwise conv (no bias).
+            CommonWeightLoader.applyConv1dWeights(
+                to: block.attn.fsmnBlock, prefix: "\(p).attn.fsmn_block",
+                from: weights, transpose: false)
+
+            // Layer norms before each sublayer.
+            CommonWeightLoader.applyLayerNormWeights(
+                to: block.attnLN, prefix: "\(p).attn_ln", from: weights)
+            CommonWeightLoader.applyLayerNormWeights(
+                to: block.mlpLN, prefix: "\(p).mlp_ln", from: weights)
+
+            // MLP: upstream stores as Sequential, so keys are mlp.0 / mlp.2.
+            CommonWeightLoader.applyLinearWeights(
+                to: block.mlpFc1, prefix: "\(p).mlp.0", from: weights)
+            CommonWeightLoader.applyLinearWeights(
+                to: block.mlpFc2, prefix: "\(p).mlp.2", from: weights)
+        }
+
+        // FSQ projection (1280 → 8). The codebook itself has no `embed` weights —
+        // FSQ quantisation is the rounding/base-3-packing math, no learned codes.
+        CommonWeightLoader.applyLinearWeights(
+            to: tokenizer.quantizer.codebook.projectDown,
+            prefix: "quantizer._codebook.project_down", from: weights)
+    }
 }

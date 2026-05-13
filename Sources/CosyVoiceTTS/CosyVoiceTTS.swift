@@ -59,9 +59,6 @@ public final class CosyVoiceTTSModel {
         offlineMode: Bool = false,
         progressHandler: ((Double, String) -> Void)? = nil
     ) async throws -> CosyVoiceTTSModel {
-        let config = CosyVoiceConfig.default
-        let model = CosyVoiceTTSModel(config: config)
-
         // Get cache directory
         let cacheDir = try cacheDir ?? HuggingFaceDownloader.getCacheDirectory(for: modelId)
 
@@ -77,13 +74,32 @@ public final class CosyVoiceTTSModel {
                 to: cacheDir,
                 additionalFiles: [
                     "llm.safetensors", "flow.safetensors", "hifigan.safetensors",
-                    "vocab.json", "merges.txt", "tokenizer_config.json",
+                    "vocab.json", "merges.txt", "tokenizer_config.json", "config.json",
                 ],
                 offlineMode: offlineMode
             ) { progress in
                 progressHandler?(progress * 0.5, "Downloading...")
             }
         }
+
+        // Read the bundle's `config.json` so the LLM module is constructed with
+        // the correct quantization bit width. Without this, the model defaults
+        // to 4-bit and MLX's QuantizedLinear blows up on 8-bit weights.
+        var config = CosyVoiceConfig.default
+        let configURL = cacheDir.appendingPathComponent("config.json")
+        if FileManager.default.fileExists(atPath: configURL.path),
+           let data = try? Data(contentsOf: configURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let quant = json["quantization"] as? [String: Any] {
+            // The convert.py emits BOTH `bits` (legacy default = 4) and a
+            // per-component override `llm_bits`. Prefer the LLM-specific value.
+            if let bits = (quant["llm_bits"] as? Int) ?? (quant["bits"] as? Int) {
+                config.llm.bits = bits
+            }
+            if let gs = quant["group_size"] as? Int { config.llm.groupSize = gs }
+            print("  Bundle quantization: \(config.llm.bits)-bit (group_size \(config.llm.groupSize))")
+        }
+        let model = CosyVoiceTTSModel(config: config)
 
         // Load weights
         progressHandler?(0.5, "Loading LLM weights...")

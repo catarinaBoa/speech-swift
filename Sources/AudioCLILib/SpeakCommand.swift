@@ -92,6 +92,9 @@ public struct SpeakCommand: ParsableCommand {
     @Option(name: .long, help: "[cosyvoice] Path to speech_tokenizer.safetensors (S3-Tokenizer-v3). When supplied, --voice-sample is upgraded from spk-only cloning (cos~0.83 cap) to upstream zero-shot conditioning with prompt_token + prompt_feat (preserves identity through emotion changes). Auto-detected in the bundle's cache dir if omitted.")
     public var cosySpeechTokenizer: String?
 
+    @Option(name: .long, help: "[cosyvoice] Override the model cache directory. When supplied, the bundle is loaded directly from this directory instead of HuggingFace. Useful for testing locally-converted variants (e.g. an 8-bit LLM) without an HF push.")
+    public var cosyBundleDir: String?
+
     @Option(name: .long, help: "[cosyvoice] Reference transcript: the text content of --voice-sample. Required for proper zero-shot voice cloning — without it the LLM has acoustic context but no idea what was said in the reference, and emits content-incorrect speech in the right voice.")
     public var cosyReferenceTranscript: String?
 
@@ -399,8 +402,11 @@ public struct SpeakCommand: ParsableCommand {
     private func runCosyVoice() throws {
         try runAsync {
             print("Loading CosyVoice3 model...")
+            let bundleOverride = cosyBundleDir.map { URL(fileURLWithPath: $0) }
             let cosyModel = try await CosyVoiceTTSModel.fromPretrained(
-                modelId: modelId, progressHandler: reportProgress)
+                modelId: modelId,
+                cacheDir: bundleOverride,
+                progressHandler: reportProgress)
 
             guard let inputText = text else {
                 print("Error: text argument is required for CosyVoice")

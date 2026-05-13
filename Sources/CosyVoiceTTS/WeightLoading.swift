@@ -34,47 +34,79 @@ public enum CosyVoiceWeightLoader {
     /// - speech_head.weight/.scales/.biases (quantized)
     public static func loadLLM(_ llm: CosyVoiceLLM, from url: URL) throws {
         let weights = try CommonWeightLoader.loadSafetensors(url: url)
+        let bits = llm.config.bits
+        let groupSize = llm.config.groupSize
 
-        // Text embedding (not quantized)
-        CommonWeightLoader.applyEmbeddingWeights(
-            to: llm.textEmbedding, prefix: "text_embedding", from: weights)
+        // ─── Phase 1: replace every QuantizedLinear via Module.update(modules:) ──
+        //
+        // The convenience init `QuantizedLinear(in, out, bias, groupSize, bits)`
+        // initialises with a random fp weight and runs `MLX.quantized(...)` to
+        // produce a packed uint32 placeholder. We then used to update the
+        // module's parameters with the loaded weights via `update(parameters:)`.
+        // At 4-bit this path works; at 8-bit the matmul site sees fp16 instead
+        // of uint32 (MLX errors with "weight matrix should be uint32 but
+        // received float16"). The fix is to construct each QuantizedLinear via
+        // the designated init that takes the pre-quantized weight + scales +
+        // biases directly — no placeholder, no dtype confusion.
+        //
+        // `@ModuleInfo` properties cannot be reassigned through `wrappedValue`
+        // (fatalError on re-set), so the swap goes through `Module.update
+        // (modules:)`. That walks the model's children tree and replaces each
+        // matching key. Children are keyed by Swift property name (camelCase),
+        // hence the snake-to-camel translation table below.
+        let perLayerProj: [(String, String, Bool)] = [
+            ("self_attn.q_proj", "selfAttn.qProj", true),
+            ("self_attn.k_proj", "selfAttn.kProj", true),
+            ("self_attn.v_proj", "selfAttn.vProj", true),
+            ("self_attn.o_proj", "selfAttn.oProj", false),
+            ("mlp.gate_proj",    "mlp.gateProj",    false),
+            ("mlp.up_proj",      "mlp.upProj",      false),
+            ("mlp.down_proj",    "mlp.downProj",    false),
+        ]
 
-        // Speech embedding (not quantized)
-        CommonWeightLoader.applyEmbeddingWeights(
-            to: llm.speechEmbedding, prefix: "speech_embedding", from: weights)
-
-        // Transformer layers
-        for (i, layer) in llm.layers.enumerated() {
-            let prefix = "layers.\(i)"
-
-            // Attention projections (quantized)
-            CommonWeightLoader.applyQuantizedLinearWeights(
-                to: layer.selfAttn.qProj, prefix: "\(prefix).self_attn.q_proj", from: weights)
-            CommonWeightLoader.applyQuantizedLinearWeights(
-                to: layer.selfAttn.kProj, prefix: "\(prefix).self_attn.k_proj", from: weights)
-            CommonWeightLoader.applyQuantizedLinearWeights(
-                to: layer.selfAttn.vProj, prefix: "\(prefix).self_attn.v_proj", from: weights)
-            CommonWeightLoader.applyQuantizedLinearWeights(
-                to: layer.selfAttn.oProj, prefix: "\(prefix).self_attn.o_proj", from: weights)
-
-            // Layer norms
-            CommonWeightLoader.applyRMSNormWeights(
-                to: layer.inputLayerNorm, prefix: "\(prefix).input_layernorm", from: weights)
-            CommonWeightLoader.applyRMSNormWeights(
-                to: layer.postAttentionLayerNorm, prefix: "\(prefix).post_attention_layernorm", from: weights)
-
-            // MLP (quantized SwiGLU)
-            CommonWeightLoader.applyQuantizedMLPWeights(
-                to: layer.mlp, prefix: "\(prefix).mlp", from: weights)
+        var qReplacements: [String: Module] = [:]
+        for i in 0..<llm.layers.count {
+            for (sfxSnake, sfxCamel, hasLinearBias) in perLayerProj {
+                let stPrefix  = "layers.\(i).\(sfxSnake)"
+                let modPath   = "layers.\(i).\(sfxCamel)"
+                guard let w = weights["\(stPrefix).weight"],
+                      let s = weights["\(stPrefix).scales"] else { continue }
+                let quantBiases = weights["\(stPrefix).biases"]
+                let linearBias  = hasLinearBias ? weights["\(stPrefix).bias"] : nil
+                qReplacements[modPath] = QuantizedLinear(
+                    weight: w, bias: linearBias,
+                    scales: s, biases: quantBiases,
+                    groupSize: groupSize, bits: bits)
+            }
         }
 
-        // Final norm
+        // Speech head sits at the LLM's top level; no Linear bias upstream.
+        if let w = weights["speech_head.weight"],
+           let s = weights["speech_head.scales"] {
+            qReplacements["speechHead"] = QuantizedLinear(
+                weight: w, bias: nil,
+                scales: s, biases: weights["speech_head.biases"],
+                groupSize: groupSize, bits: bits)
+        }
+
+        let nested = NestedDictionary<String, Module>.unflattened(qReplacements)
+        llm.update(modules: nested)
+
+        // ─── Phase 2: non-quantized parameters (embeddings, layer norms) ───────
+        CommonWeightLoader.applyEmbeddingWeights(
+            to: llm.textEmbedding, prefix: "text_embedding", from: weights)
+        CommonWeightLoader.applyEmbeddingWeights(
+            to: llm.speechEmbedding, prefix: "speech_embedding", from: weights)
+        for (i, layer) in llm.layers.enumerated() {
+            CommonWeightLoader.applyRMSNormWeights(
+                to: layer.inputLayerNorm,
+                prefix: "layers.\(i).input_layernorm", from: weights)
+            CommonWeightLoader.applyRMSNormWeights(
+                to: layer.postAttentionLayerNorm,
+                prefix: "layers.\(i).post_attention_layernorm", from: weights)
+        }
         CommonWeightLoader.applyRMSNormWeights(
             to: llm.norm, prefix: "norm", from: weights)
-
-        // Speech head (quantized)
-        CommonWeightLoader.applyQuantizedLinearWeights(
-            to: llm.speechHead, prefix: "speech_head", from: weights)
     }
 
     // MARK: - Flow (DiT Decoder)
@@ -295,5 +327,73 @@ public enum CosyVoiceWeightLoader {
         if let alpha = weights["\(prefix).alpha"] {
             act.update(parameters: ModuleParameters(values: ["alpha": .value(alpha)]))
         }
+    }
+
+    // MARK: - Speech Tokenizer (zero-shot voice cloning)
+
+    /// Load weights into a `SpeechTokenizerModel` from `speech_tokenizer.safetensors`.
+    ///
+    /// Expected keys (produced by `convert_speech_tokenizer` in
+    /// `speech-models/models/cosyvoice-tts/export/convert.py`):
+    /// - encoder.conv1.weight/bias                                 (MLX-layout [out, k, in])
+    /// - encoder.conv2.weight/bias                                 (MLX-layout)
+    /// - encoder.blocks.{i}.attn.{query,key,value,out}.weight/bias (key has no bias)
+    /// - encoder.blocks.{i}.attn.fsmn_block.weight                 (MLX-layout, depthwise k=31)
+    /// - encoder.blocks.{i}.attn_ln.weight/bias                    (LayerNorm)
+    /// - encoder.blocks.{i}.mlp.0.weight/bias                      (Linear, in→hidden)
+    /// - encoder.blocks.{i}.mlp.2.weight/bias                      (Linear, hidden→in)
+    /// - encoder.blocks.{i}.mlp_ln.weight/bias                     (LayerNorm)
+    /// - quantizer._codebook.project_down.weight/bias              (Linear 1280→8)
+    ///
+    /// Conv1d weights are already transposed to MLX `[out, kernel, in]` by the
+    /// conversion script, so all Conv1d loads use `transpose: false`.
+    public static func loadSpeechTokenizer(
+        _ tokenizer: SpeechTokenizerModel, from url: URL
+    ) throws {
+        let weights = try CommonWeightLoader.loadSafetensors(url: url)
+
+        // Subsampling convs (channels-first stride-2 each).
+        CommonWeightLoader.applyConv1dWeights(
+            to: tokenizer.encoder.conv1, prefix: "encoder.conv1", from: weights, transpose: false)
+        CommonWeightLoader.applyConv1dWeights(
+            to: tokenizer.encoder.conv2, prefix: "encoder.conv2", from: weights, transpose: false)
+
+        // Transformer blocks.
+        for (i, block) in tokenizer.encoder.blocks.enumerated() {
+            let p = "encoder.blocks.\(i)"
+
+            // Attention projections — key has no bias, the rest do.
+            CommonWeightLoader.applyLinearWeights(
+                to: block.attn.query, prefix: "\(p).attn.query", from: weights)
+            CommonWeightLoader.applyLinearWeights(
+                to: block.attn.key, prefix: "\(p).attn.key", from: weights)
+            CommonWeightLoader.applyLinearWeights(
+                to: block.attn.value, prefix: "\(p).attn.value", from: weights)
+            CommonWeightLoader.applyLinearWeights(
+                to: block.attn.out, prefix: "\(p).attn.out", from: weights)
+
+            // FSMN depthwise conv (no bias).
+            CommonWeightLoader.applyConv1dWeights(
+                to: block.attn.fsmnBlock, prefix: "\(p).attn.fsmn_block",
+                from: weights, transpose: false)
+
+            // Layer norms before each sublayer.
+            CommonWeightLoader.applyLayerNormWeights(
+                to: block.attnLN, prefix: "\(p).attn_ln", from: weights)
+            CommonWeightLoader.applyLayerNormWeights(
+                to: block.mlpLN, prefix: "\(p).mlp_ln", from: weights)
+
+            // MLP: upstream stores as Sequential, so keys are mlp.0 / mlp.2.
+            CommonWeightLoader.applyLinearWeights(
+                to: block.mlpFc1, prefix: "\(p).mlp.0", from: weights)
+            CommonWeightLoader.applyLinearWeights(
+                to: block.mlpFc2, prefix: "\(p).mlp.2", from: weights)
+        }
+
+        // FSQ projection (1280 → 8). The codebook itself has no `embed` weights —
+        // FSQ quantisation is the rounding/base-3-packing math, no learned codes.
+        CommonWeightLoader.applyLinearWeights(
+            to: tokenizer.quantizer.codebook.projectDown,
+            prefix: "quantizer._codebook.project_down", from: weights)
     }
 }

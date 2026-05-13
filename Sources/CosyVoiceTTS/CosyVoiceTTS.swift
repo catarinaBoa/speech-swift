@@ -59,9 +59,6 @@ public final class CosyVoiceTTSModel {
         offlineMode: Bool = false,
         progressHandler: ((Double, String) -> Void)? = nil
     ) async throws -> CosyVoiceTTSModel {
-        let config = CosyVoiceConfig.default
-        let model = CosyVoiceTTSModel(config: config)
-
         // Get cache directory
         let cacheDir = try cacheDir ?? HuggingFaceDownloader.getCacheDirectory(for: modelId)
 
@@ -77,13 +74,32 @@ public final class CosyVoiceTTSModel {
                 to: cacheDir,
                 additionalFiles: [
                     "llm.safetensors", "flow.safetensors", "hifigan.safetensors",
-                    "vocab.json", "merges.txt", "tokenizer_config.json",
+                    "vocab.json", "merges.txt", "tokenizer_config.json", "config.json",
                 ],
                 offlineMode: offlineMode
             ) { progress in
                 progressHandler?(progress * 0.5, "Downloading...")
             }
         }
+
+        // Read the bundle's `config.json` so the LLM module is constructed with
+        // the correct quantization bit width. Without this, the model defaults
+        // to 4-bit and MLX's QuantizedLinear blows up on 8-bit weights.
+        var config = CosyVoiceConfig.default
+        let configURL = cacheDir.appendingPathComponent("config.json")
+        if FileManager.default.fileExists(atPath: configURL.path),
+           let data = try? Data(contentsOf: configURL),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let quant = json["quantization"] as? [String: Any] {
+            // The convert.py emits BOTH `bits` (legacy default = 4) and a
+            // per-component override `llm_bits`. Prefer the LLM-specific value.
+            if let bits = (quant["llm_bits"] as? Int) ?? (quant["bits"] as? Int) {
+                config.llm.bits = bits
+            }
+            if let gs = quant["group_size"] as? Int { config.llm.groupSize = gs }
+            print("  Bundle quantization: \(config.llm.bits)-bit (group_size \(config.llm.groupSize))")
+        }
+        let model = CosyVoiceTTSModel(config: config)
 
         // Load weights
         progressHandler?(0.5, "Loading LLM weights...")
@@ -180,16 +196,54 @@ public final class CosyVoiceTTSModel {
         language: String = "english",
         instruction: String = "You are a helpful assistant.",
         speakerEmbedding: [Float]? = nil,
+        promptToken: MLXArray? = nil,
+        promptFeat: MLXArray? = nil,
+        promptText: String? = nil,
         verbose: Bool = false
     ) -> [Float] {
-        // 1. Tokenize text via Qwen2.5 BPE tokenizer
-        let textTokens = tokenizeText(text, language: language, instruction: instruction)
+        // 1. Tokenize text via Qwen2.5 BPE tokenizer. Track the content text
+        //    length separately (without the instruction frame) so the LLM's
+        //    min/max-len constraints scale to the actual content, not the
+        //    instruction. Upstream: `min_len = (text_len - prompt_text_len) * ratio`.
+        let contentTokens = tokenizer.encode(text).map { Int32($0) }
 
-        // 2. Generate speech tokens via LLM
+        // For zero-shot voice cloning, upstream's text input is literally
+        //   concat(transcript_tokens + [<|endofprompt|>], content_tokens)
+        // with NO "You are a helpful assistant. " system frame. Adding the
+        // system frame puts the LLM off the training distribution and it
+        // reads back the tail of the transcript instead of synthesising the
+        // user text. So when promptText is set we bypass tokenizeText entirely
+        // and build the sequence directly.
+        let textTokens: [Int32]
+        if let pt = promptText, !pt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let promptTextTokens = tokenizer.encode(pt).map { Int32($0) }
+            textTokens = promptTextTokens + [Self.endOfPromptToken] + contentTokens
+        } else {
+            textTokens = tokenizeText(text, language: language, instruction: instruction)
+        }
+
+        // 2. Generate speech tokens via LLM.
+        //    For zero-shot cloning, the reference's FSQ codes are passed as
+        //    `promptSpeechTokens` so the LLM's autoregressive state already
+        //    encodes the target speaker before generation begins. Without this
+        //    the LLM emits "neutral default voice" tokens that conflict with
+        //    the flow's prompt_token + prompt_feat anchors and the cloned
+        //    output drifts to a different voice (see PR #247).
+        let promptSpeechTokensArr: [Int32]? = promptToken.map { pt in
+            pt.reshaped(-1).asArray(Int32.self)
+        }
+        // Cap maxTokens proportionally to the content length. With prompt
+        // conditioning the LLM is biased to "keep speaking" — a fixed cap of
+        // 500 lets a 5-word phrase generate 20 s of repeats. Scale to 10×
+        // content_tokens (with a sensible floor for very short content). This
+        // mirrors upstream's `max_len = content_text_len * max_token_text_ratio`.
+        let scaledMaxTokens = max(200, contentTokens.count * 10)
         var t0 = CFAbsoluteTimeGetCurrent()
         let speechTokens = llm.generate(
             textTokens: textTokens,
-            maxTokens: 500  // ~20 seconds of audio at 25 Hz
+            promptSpeechTokens: promptSpeechTokensArr,
+            contentTextLength: contentTokens.count,
+            maxTokens: scaledMaxTokens
         )
         if verbose {
             let llmTime = CFAbsoluteTimeGetCurrent() - t0
@@ -202,19 +256,50 @@ public final class CosyVoiceTTSModel {
             return []
         }
 
-        // 3. Convert speech tokens to mel spectrogram via flow matching
+        // 3. Convert speech tokens to mel spectrogram via flow matching.
+        //    When promptToken + promptFeat are supplied (the upstream zero-shot
+        //    cloning path), the flow returns mel for the *full* prompt + generation
+        //    span; we slice off the prompt region before HiFi-GAN.
         t0 = CFAbsoluteTimeGetCurrent()
         let tokenArray = MLXArray(speechTokens).expandedDimensions(axis: 0)  // [1, T]
-        let mel: MLXArray
-        if let embedding = speakerEmbedding {
-            let spkEmb = MLXArray(embedding).expandedDimensions(axis: 0)  // [1, 192]
-            mel = flow(tokens: tokenArray, spkEmbedding: spkEmb)
-        } else {
-            mel = flow(tokens: tokenArray)
+        let spkEmb: MLXArray? = speakerEmbedding.map {
+            MLXArray($0).expandedDimensions(axis: 0)
         }
-        eval(mel)
+        let fullMel = flow(
+            tokens: tokenArray,
+            spkEmbedding: spkEmb,
+            promptToken: promptToken,
+            promptFeat: promptFeat
+        )
+        eval(fullMel)
+
+        // Pass the FULL mel (prompt + generation) to HiFi-GAN. Slicing the mel
+        // here means HiFi-GAN's causal convolutions warm up against zero-padded
+        // boundaries, producing a click/transient ~10 mel frames into the
+        // generated audio (the convolutional receptive field). Instead we let
+        // HiFi-GAN render both regions continuously and trim the prompt-region
+        // audio AFTER, where the boundary is smooth.
+        let mel = fullMel
+        let promptAudioSamples: Int
+        if let pf = promptFeat {
+            let promptMelLen = pf.dim(2)
+            // mel-rate is 50 Hz, audio sample rate is 24 kHz → 480 samples/mel
+            promptAudioSamples = promptMelLen * (config.sampleRate / 50)
+        } else {
+            promptAudioSamples = 0
+        }
+
+        // Optional debug dump of the mel that reaches HiFi-GAN.
+        if let dumpDir = ProcessInfo.processInfo.environment["COSY_DEBUG_DUMP_DIR"] {
+            CosyVoiceDebugDump.tryWrite(mel, name: "swift_hifigan_input_mel", in: dumpDir)
+        }
+
         if verbose {
-            let suffix = speakerEmbedding != nil ? " (speaker-conditioned)" : ""
+            var path: [String] = []
+            if speakerEmbedding != nil { path.append("spk") }
+            if promptToken != nil { path.append("prompt_token") }
+            if promptFeat != nil { path.append("prompt_feat") }
+            let suffix = path.isEmpty ? "" : " (\(path.joined(separator: "+")))"
             print(String(format: "  Flow: %.0fms%@", (CFAbsoluteTimeGetCurrent() - t0) * 1000, suffix))
         }
 
@@ -226,8 +311,16 @@ public final class CosyVoiceTTSModel {
             print(String(format: "  HiFi-GAN: %.0fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000))
         }
 
-        // 5. Extract float samples
-        return audio.reshaped(-1).asArray(Float.self)
+        // 5. Extract float samples, trimming the prompt-region audio so the
+        //    caller only sees the synthesised content. The boundary inside
+        //    HiFi-GAN's continuous render is smoother than a pre-sliced mel,
+        //    so trimming here removes the slice-boundary click that appeared
+        //    ~10 mel frames into the audio in the old path.
+        var samples = audio.reshaped(-1).asArray(Float.self)
+        if promptAudioSamples > 0 && promptAudioSamples < samples.count {
+            samples = Array(samples[promptAudioSamples...])
+        }
+        return samples
     }
 
     /// Synthesize with streaming output.
@@ -268,23 +361,35 @@ public final class CosyVoiceTTSModel {
 
     /// Token ID for `<|endofprompt|>` — added by CosyVoice3 but not in base tokenizer config.
     /// The text embedding table (151936 entries) includes this trained embedding at index 151646.
-    private static let endOfPromptToken: Int32 = 151646
+    static let endOfPromptToken: Int32 = 151646
+
+    /// System-prompt frame that upstream uses in every official example.
+    /// Custom style instructions are *appended* to this frame, not substituted
+    /// for it — otherwise the model treats the instruction as content to speak.
+    static let assistantPrefix = "You are a helpful assistant."
 
     /// Format and tokenize text for CosyVoice3 LLM.
     ///
-    /// CosyVoice3 requires the text format: `{instruction}<|endofprompt|>{text_to_synthesize}`
-    /// The `<|endofprompt|>` token (ID 151646) marks the boundary between instruction and content.
-    private func tokenizeText(
+    /// Upstream training format: `"You are a helpful assistant. {style}<|endofprompt|>{text}"`.
+    /// Stripping the assistant prefix pushes the model out of distribution and it
+    /// reads the style instruction aloud instead of using it as conditioning.
+    func tokenizeText(
         _ text: String, language: String,
         instruction: String = "You are a helpful assistant."
     ) -> [Int32] {
-        // Encode instruction prefix
-        let instructionTokens = tokenizer.encode(instruction).map { Int32($0) }
+        let framedInstruction: String
+        let trimmed = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed == Self.assistantPrefix {
+            framedInstruction = Self.assistantPrefix
+        } else if trimmed.hasPrefix(Self.assistantPrefix) {
+            framedInstruction = trimmed
+        } else {
+            framedInstruction = "\(Self.assistantPrefix) \(trimmed)"
+        }
 
-        // Encode text to synthesize
+        let instructionTokens = tokenizer.encode(framedInstruction).map { Int32($0) }
         let textTokens = tokenizer.encode(text).map { Int32($0) }
 
-        // Concatenate: [instruction_tokens, <|endofprompt|>, text_tokens]
         return instructionTokens + [Self.endOfPromptToken] + textTokens
     }
 }

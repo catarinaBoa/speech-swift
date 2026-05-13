@@ -26,6 +26,17 @@ public struct CosyVoiceLLMConfig: Codable, Sendable {
     public var taskIdToken: Int { speechTokenSize + 2 }
     public var fillToken: Int { speechTokenSize + 3 }
 
+    /// Stop tokens recognised by the LLM during autoregressive generation.
+    /// Upstream's `Qwen2LM` (which `CosyVoice3LM` inherits) defines
+    ///   `stop_token_ids = [speech_token_size + i for i in range(3)]`
+    /// so EOS, "stop_1", and "fill" all break the generation loop. Our port
+    /// previously only broke on eosToken, forcing the LLM to keep generating
+    /// when it wanted to stop via either of the other two — observable as
+    /// per-segment repetitions in long-form synthesis.
+    public var stopTokens: [Int] {
+        [speechTokenSize, speechTokenSize + 1, speechTokenSize + 2]
+    }
+
     public init() {}
 }
 

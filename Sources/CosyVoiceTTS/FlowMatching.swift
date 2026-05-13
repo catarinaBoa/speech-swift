@@ -262,58 +262,111 @@ public class CosyVoiceFlowModel: Module {
         super.init()
     }
 
-    /// Generate a mel spectrogram from speech tokens.
+    /// Generate a mel spectrogram from speech tokens, optionally conditioned on a
+    /// reference clip via prepended prompt tokens + frame-aligned prompt mel.
+    ///
+    /// When `promptToken` and `promptFeat` are supplied (the upstream zero-shot
+    /// cloning path), they're concatenated to `tokens` / written into the DiT's
+    /// `cond` slot so the flow has a per-frame anchor of the reference voice. The
+    /// returned mel still spans the **full** sequence (prompt + generated); the
+    /// caller is responsible for slicing off the first `promptFeat.dim(2)`
+    /// frames before passing to HiFi-GAN.
     ///
     /// - Parameters:
-    ///   - tokens: `[B, T]` speech token IDs (FSQ codes 0-6560)
-    ///   - spkEmbedding: `[B, 192]` raw speaker embedding, or nil for single-speaker
-    ///   - nTimesteps: ODE solver steps (default from config, typically 10)
-    ///   - temperature: noise temperature for sampling (default 1.0)
-    /// - Returns: `[B, 80, T_mel]` mel spectrogram where `T_mel = T * tokenMelRatio`
+    ///   - tokens: `[B, T]` speech token IDs (FSQ codes 0-6560) for the *new*
+    ///     content to synthesize.
+    ///   - spkEmbedding: `[B, 192]` raw CAM++ speaker embedding, or nil.
+    ///   - promptToken: `[B, T_prompt]` FSQ codes of the reference audio (from
+    ///     `SpeechTokenizerModel.encode`), or nil for the non-cloning path.
+    ///   - promptFeat: `[B, 80, T_prompt_mel]` Matcha-style log-mel of the
+    ///     reference (from `FlowMelExtractor.extract`), or nil. **Must** satisfy
+    ///     `T_prompt_mel == T_prompt * tokenMelRatio` so the cond region aligns
+    ///     with the upsampled mu region — the caller's only invariant.
+    ///   - nTimesteps: ODE solver steps (default from config, typically 10).
+    ///   - temperature: noise temperature for sampling.
+    /// - Returns: `[B, 80, T_mel]` mel spectrogram, T_mel = (T + T_prompt) * 2.
     public func callAsFunction(
         tokens: MLXArray,
         spkEmbedding: MLXArray? = nil,
+        promptToken: MLXArray? = nil,
+        promptFeat: MLXArray? = nil,
         nTimesteps: Int? = nil,
         temperature: Float = 1.0
     ) -> MLXArray {
         let steps = nTimesteps ?? config.nTimesteps
 
-        // 1. Embed tokens: [B, T] → [B, T, 80]
-        var mu = inputEmbedding(tokens)
+        // 1. Prepend prompt_token to the generated tokens (upstream:
+        //    `text = torch.concat([prompt_text, text], dim=1)` in CausalMaskedDiffWithDiT).
+        let combinedTokens: MLXArray
+        if let pt = promptToken {
+            precondition(pt.dim(0) == tokens.dim(0),
+                         "promptToken batch must match tokens batch")
+            combinedTokens = concatenated([pt, tokens], axis: 1)
+        } else {
+            combinedTokens = tokens
+        }
 
-        // 2. Pre-lookahead conv encoder: [B, T, 80] → NCL → [B, 80, T] → NLC → [B, T, 80]
+        // 2. Embed combined tokens: [B, T_total] → [B, T_total, 80]
+        var mu = inputEmbedding(combinedTokens)
+
+        // 3. Pre-lookahead conv encoder: [B, T, 80] → NCL → [B, 80, T] → NLC → [B, T, 80]
         mu = preLookaheadLayer(mu.transposed(0, 2, 1)).transposed(0, 2, 1)
 
-        // 3. Upsample from token rate (25 Hz) to mel rate (50 Hz)
-        //    [B, T, 80] → [B, T*2, 80]  (repeat_interleave, each frame duplicated)
+        // 4. Upsample 25 Hz → 50 Hz (repeat-interleave by tokenMelRatio).
         let muUpsampled = RepeatInterleaveUpsampler.upsample(mu, ratio: config.tokenMelRatio)
         let melLen = muUpsampled.dim(1)
 
-        // 4. Transpose to [B, 80, T_mel] for DiT (expects channel-first)
+        // 5. NLC → NCL for the DiT.
         let muTransposed = muUpsampled.transposed(0, 2, 1)
 
-        // 5. Create mask [B, 1, T_mel] (all ones — no padding)
-        let batchSize = tokens.dim(0)
+        // 6. Validity mask (no padding inside generation — all ones).
+        let batchSize = combinedTokens.dim(0)
         let mask = MLXArray.ones([batchSize, 1, melLen]).asType(muTransposed.dtype)
 
-        // 6. Project speaker embedding if provided
-        //    L2-normalize first, then affine projection: [B, 192] → [B, 80]
+        // 7. Speaker conditioning (L2-norm then affine 192 → 80).
         let spks: MLXArray? = spkEmbedding.map { emb in
             let norm = sqrt(sum(emb * emb, axis: -1, keepDims: true)) + 1e-8
             let normalized = emb / norm
             return spkEmbedAffineLayer(normalized)
         }
 
-        // 7. Run flow matching ODE solver
+        // 8. Build the DiT cond signal. Upstream layout:
+        //      conds[:, :, :prompt_mel_len] = prompt_feat
+        //      conds[:, :, prompt_mel_len:] = 0
+        //    This is what gives the flow a per-frame timbre anchor — without it
+        //    the LLM's emotion-loaded tokens dominate via the spks path alone.
+        let cond: MLXArray?
+        if let pf = promptFeat {
+            precondition(pf.dim(0) == batchSize,
+                         "promptFeat batch must match tokens batch")
+            precondition(pf.dim(1) == config.outputSize,
+                         "promptFeat mel dim must be \(config.outputSize), got \(pf.dim(1))")
+            let promptMelLen = pf.dim(2)
+            precondition(promptMelLen <= melLen,
+                         "promptFeat (\(promptMelLen) frames) longer than total mel (\(melLen))")
+            let genMelLen = melLen - promptMelLen
+            if genMelLen > 0 {
+                let zerosAfter = MLXArray.zeros(
+                    [batchSize, config.outputSize, genMelLen]
+                ).asType(pf.dtype)
+                cond = concatenated([pf, zerosAfter], axis: 2)
+            } else {
+                cond = pf
+            }
+        } else {
+            cond = nil
+        }
+
+        // 9. Run the flow matching ODE solver.
         let mel = decoder.forward(
             mu: muTransposed,
             mask: mask,
             nTimesteps: steps,
             temperature: temperature,
             spks: spks,
-            cond: nil
+            cond: cond
         )
 
-        return mel  // [B, 80, T_mel]
+        return mel  // [B, 80, T_mel] — caller slices off [:, :, :promptMelLen]
     }
 }

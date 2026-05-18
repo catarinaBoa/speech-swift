@@ -51,7 +51,18 @@ public enum HuggingFaceDownloader {
 
     // MARK: - Weight Existence Check
 
-    /// Check if safetensors weights exist in a directory.
+    /// Extensions recognised as cached model weights: the canonical
+    /// HF `.safetensors` layout plus Apple CoreML bundle directories
+    /// (`.mlmodelc`, `.mlpackage`) shipped by CoreML-only repos.
+    public static let weightFileExtensions: Set<String> = [
+        "safetensors", "mlmodelc", "mlpackage"
+    ]
+
+    /// Returns `true` when `directory` contains at least one entry
+    /// whose extension matches `weightFileExtensions`. Used by
+    /// `downloadWeights` to short-circuit network requests when
+    /// `offlineMode: true` is set on caches that contain only CoreML
+    /// bundles and no `.safetensors` files.
     public static func weightsExist(in directory: URL) -> Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: directory.path) else { return false }
@@ -62,7 +73,7 @@ public enum HuggingFaceDownloader {
             AudioLog.download.debug("Could not list directory \(directory.path): \(error)")
             contents = []
         }
-        return contents.contains { $0.pathExtension == "safetensors" }
+        return contents.contains { weightFileExtensions.contains($0.pathExtension) }
     }
 
     // MARK: - Download

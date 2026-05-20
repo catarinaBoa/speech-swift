@@ -22,7 +22,8 @@ extension Qwen3TTSModel {
         let tts = try await Qwen3TTSModel.fromPretrained(
             modelId: modelId, cacheDir: cacheDir, offlineMode: offlineMode, progressHandler: progressHandler)
 
-        let weightsDir = try cacheDir ?? HuggingFaceDownloader.getCacheDirectory(for: modelId)
+        let tokenizerModelId = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+        let weightsDir = try cacheDir ?? HuggingFaceDownloader.getCacheDirectory(for: tokenizerModelId)
 
         // Build encoder with same config as decoder
         let encoderConfig = tts.config.speechTokenizerDecoder
@@ -111,11 +112,18 @@ extension Qwen3TTSModel {
         let t1 = CFAbsoluteTimeGetCurrent()
 
         // Step 5: Autoregressive generation (reuse existing method)
+        var cappedSampling = sampling
+        let textTokenCount = tokenizer.encode(text).count
+        cappedSampling.maxTokens = min(sampling.maxTokens, max(75, textTokenCount * 6))
+        if cappedSampling.maxTokens < sampling.maxTokens {
+            print("  ICL: capped maxTokens \(sampling.maxTokens) -> \(cappedSampling.maxTokens) for \(textTokenCount) text tokens")
+        }
+
         let (allCodebooks, numFrames) = generateWithCodePredictor(
             prefillEmbeds: prefillEmbeds,
             trailingTextHidden: trailingTextHidden,
             ttsPadEmbed: ttsPadEmbed,
-            sampling: sampling)
+            sampling: cappedSampling)
 
         eval(allCodebooks)
         let t2 = CFAbsoluteTimeGetCurrent()

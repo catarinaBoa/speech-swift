@@ -9,6 +9,10 @@ Mac और iOS के लिए ऑन-डिवाइस स्पीच रि
 **[📚 पूर्ण डॉक्यूमेंटेशन →](https://soniqo.audio/hi)** · **[🤗 HuggingFace मॉडल](https://huggingface.co/aufklarer)** · **[📝 ब्लॉग](https://blog.ivan.digital)**
 
 <p align="center">
+  <a href="https://www.producthunt.com/products/speech-swift?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-speech-swift" target="_blank" rel="noopener noreferrer"><img alt="speech-swift -  The whole speech stack, on your laptop. | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1151422&amp;theme=light&amp;t=1779261593657"></a>
+</p>
+
+<p align="center">
   <a href="https://youtu.be/x9zgcaW0gUk">
     <img src="https://img.youtube.com/vi/x9zgcaW0gUk/maxresdefault.jpg" width="640" alt="MacBook पर लोकल स्पीच AI — YouTube पर चार मिनट का ओपन-सोर्स लाइब्रेरी टूर देखें">
   </a>

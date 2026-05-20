@@ -469,10 +469,9 @@ public class ResidualVectorQuantizer: Module {
         // output projection weight. outputProj is Conv1d(codebookDim, outputDim, k=1)
         // with weight shape [outputDim, codebookDim, 1].
         // outputProj.weight: [outputDim, kernelSize=1, codebookDim] → squeeze kernel dim
-        let w = outputProj.weight.squeezed(axis: 1)  // [outputDim, codebookDim]
-        // Pseudo-inverse: x [B,T,outputDim] × w^T [codebookDim,outputDim]^T won't work
-        // Instead use least-squares: x @ pinv(w) ≈ x @ w^T (for orthogonal w)
-        var residual = matmul(x, w)  // [B, T, codebookDim]
+        let w = outputProj.weight.squeezed(axis: 1)
+        let projection = w.dim(0) == x.dim(-1) ? w : w.T
+        var residual = matmul(x, projection)  // [B, T, codebookDim]
 
         var allCodes = [MLXArray]()
         for i in 0..<numQuantizers {
